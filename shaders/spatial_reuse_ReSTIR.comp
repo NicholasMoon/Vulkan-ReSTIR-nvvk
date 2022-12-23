@@ -1,0 +1,587 @@
+/*
+ * Copyright (c) 2019-2021, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2021 NVIDIA CORPORATION
+ * SPDX-License-Identifier: Apache-2.0
+ */
+ 
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#include "raycommon.glsl"
+
+
+#define INV_PI 0.31831f
+#define PI 3.141953f
+
+
+const int GROUP_SIZE = 16;
+layout(local_size_x = GROUP_SIZE, local_size_y = GROUP_SIZE) in;
+layout(set = 0, binding = 0, rgba32f) uniform image2D inImage;
+layout(set = 0, binding = 1, rgba32f) uniform image2D outImage;
+layout(set = 0, binding = 2) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 3, rgba32f) uniform image2D colorImage;
+layout(set = 0, binding = 4) readonly buffer _InstanceInfo {PrimMeshInfo primInfo[];};
+layout(set = 0, binding = 5) readonly buffer ReSTIRDesc_ { ReSTIRDesc restirDesc; };
+
+
+// See ReSTIRControl
+layout(push_constant) uniform params_
+{
+  int   spp;
+  int   ray_depth;
+  float light_intensity;
+  float light_color_X;
+  float light_color_Y;
+  float light_color_Z;
+  int   randomize_color;
+  int   light_type;
+  int   two_sided_lights;
+  int   frame_number;
+  int   mode;
+  int   GI_mode;
+  int   M;
+  int   num_neighbors;
+  int   neighbor_radius;
+};
+
+#define BSDF_SAMPLING 1
+#define DIRECT_LIGHT_SAMPLING 2
+#define RIS_LIGHT_SAMPLING 3
+#define RIS_TEMPORAL_LIGHT_SAMPLING 4
+#define RIS_TEMPORAL_SPATIAL_LIGHT_SAMPLING 5
+#define RIS_TEMPORAL_UNBIASED_SPATIAL_LIGHT_SAMPLING 6
+
+#define AREA_LIGHT      0
+#define POINT_LIGHT     1
+#define MESH_LIGHT      2
+
+
+
+
+
+
+//----------------------------------------------------------------------------
+// Trace ray towards a light source
+//
+bool TraceRayDirect(SceneBufferPointers scene_data, in vec3 origin, in vec3 direction, out Intersection isect) {
+    rayQueryEXT rayQuery;
+
+    uint flags = gl_RayFlagsOpaqueEXT;
+
+    rayQueryInitializeEXT(rayQuery, topLevelAS, flags, 0xFF, origin, 0.01f, direction, 100);
+
+    while(rayQueryProceedEXT(rayQuery)){}
+
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+
+        isect.mesh_ID = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+        isect.tri_ID = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+        isect.t = rayQueryGetIntersectionTEXT(rayQuery, true);
+        mat4x3 object_to_world = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true);
+        mat4x3 world_to_object = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true);
+
+        vec2 ray_query_barys = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+        vec3 isect_barys = vec3(1.0f - ray_query_barys.x - ray_query_barys.y, ray_query_barys.x, ray_query_barys.y);
+
+        PrimMeshInfo pInfo = primInfo[isect.mesh_ID];
+
+        getTriangleIntersection(pInfo, scene_data, isect, isect_barys, object_to_world, world_to_object);
+
+        return true;
+    }
+    else {
+
+        isect.mesh_ID = -1;
+        isect.tri_ID = -1;
+        isect.t = -1.0f;
+        isect.p = vec3(0.0f);
+        isect.n = vec3(0.0f);
+        return false;
+    }
+}
+
+vec3 lightSample_BSDF(CoordinateSystem coordinate_system, SceneBufferPointers scene_data, vec3 R, vec3 wo, vec3 o, in int randomize_color, in vec3 light_color, in float light_intensity, inout uint rng_seed) {
+    
+    
+    vec3 wi;
+    float pdf;
+    float cos_theta;
+    vec3 f = sample_f_Diffuse_BRDF(coordinate_system, R, vec3(0,0,0), wi, pdf, cos_theta, rng_seed);
+
+    Intersection isect;
+    bool ray_hit_object = TraceRayDirect(scene_data, o, wi, isect);
+
+    if (ray_hit_object) {
+        PrimMeshInfo pInfo = primInfo[isect.mesh_ID];
+
+        vec3 Le;
+        if (light_type == AREA_LIGHT) {
+            Le = Le_SquarePlaneDiffuseAreaLight(pInfo, scene_data, wi, two_sided_lights, randomize_color, light_color, light_intensity);
+        }
+        else if (light_type == MESH_LIGHT) {
+            Le = Le_TriDiffuseAreaLight(pInfo, isect.tri_ID, scene_data, isect.p, wi, two_sided_lights, randomize_color, light_color, light_intensity);
+        }
+        else {
+            Le = Le_PointLight(pInfo, scene_data, wi, o, isect.t, light_color, light_intensity);
+        }
+
+        if (length(Le) > 0.01f) {
+            return Le * f * cos_theta / pdf;
+        }
+        else {
+            return vec3(0.0f);
+        }
+    }
+    else {
+        return vec3(0.0f);
+    }
+}
+
+vec3 lightSample_Direct_LTE(in CoordinateSystem coordinate_system, in SceneBufferPointers scene_data, in int light_ID, in vec3 R, in vec3 wo, in vec3 o, in int randomize_color, in vec3 light_color, in float light_intensity, out vec3 wi, out vec3 point_on_light, inout uint rng_seed) {
+    // get its mesh ID
+    int sampled_light_mesh_ID = scene_data.light_IDs.l[light_ID].mesh_ID;
+    int sampled_light_tri_ID = scene_data.light_IDs.l[light_ID].tri_ID;
+
+    // use the mesh ID to get access to its mesh data
+    PrimMeshInfo pInfo = primInfo[sampled_light_mesh_ID];
+
+    float pdf_L;
+    vec3 Le;
+    if (light_type == AREA_LIGHT) {
+        Le = sample_Le_SquarePlaneDiffuseAreaLight(pInfo, scene_data, two_sided_lights, randomize_color, light_color, light_intensity, o, wi, pdf_L, point_on_light, rng_seed);
+    }
+    else if (light_type == MESH_LIGHT) {
+        Le = sample_Le_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, two_sided_lights, randomize_color, light_color, light_intensity, o, wi, pdf_L, point_on_light, rng_seed);
+    }
+    else {
+        Le = sample_Le_PointLight(pInfo, scene_data, o, wi, pdf_L, point_on_light, light_color, light_intensity);
+    }
+    
+
+    float cos_theta = abs(dot(wi, coordinate_system.normal));
+
+    vec3 f = f_Diffuse_BRDF(R);
+
+    return float(uni.num_lights) * Le * f * cos_theta / pdf_L;
+}
+
+vec3 lightSample_Direct_LTE_Calc(in CoordinateSystem coordinate_system, in SceneBufferPointers scene_data, in int light_ID, in vec3 R, in vec3 wo, in vec3 o, in vec3 wi, in vec3 point_on_light, in int randomize_color, in vec3 light_color, in float light_intensity, inout uint rng_seed) {
+    // get its mesh ID
+    int sampled_light_mesh_ID = scene_data.light_IDs.l[light_ID].mesh_ID;
+    int sampled_light_tri_ID = scene_data.light_IDs.l[light_ID].tri_ID;
+
+    // use the mesh ID to get access to its mesh data
+    PrimMeshInfo pInfo = primInfo[sampled_light_mesh_ID];
+
+    float pdf_L;
+    vec3 Le;
+    if (light_type == AREA_LIGHT) {
+        Le = Le_SquarePlaneDiffuseAreaLight(pInfo, scene_data, wi, two_sided_lights, randomize_color, light_color, light_intensity);
+        pdf_L = pdf_SquarePlaneDiffuseAreaLight(pInfo, scene_data, o, point_on_light);
+    }
+    else if (light_type == MESH_LIGHT) {
+        Le = Le_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, point_on_light, wi, two_sided_lights, randomize_color, light_color, light_intensity);
+        pdf_L = pdf_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, o, point_on_light);
+    }
+    else {
+        Le = Le_PointLight(pInfo, scene_data, wi, o, length(point_on_light - o), light_color, light_intensity);
+        pdf_L = 1.0f;
+    }
+    
+
+    float cos_theta = abs(dot(wi, coordinate_system.normal));
+
+    vec3 f = f_Diffuse_BRDF(R);
+
+    return float(uni.num_lights) * Le * f * cos_theta / pdf_L;
+}
+
+vec3 lightSample_Direct(CoordinateSystem coordinate_system, SceneBufferPointers scene_data, vec3 R, vec3 wo, vec3 o, in int randomize_color, in vec3 light_color, in float light_intensity, inout uint rng_seed) {
+    // pick a light to sample with a uniform random variable
+    int sampled_light_ID = uniformSample1DIndex(rng_seed, uni.num_lights);
+    //int sampled_light_tri_ID = uniformSample1DIndex(rng_seed, uni.num_lights);
+
+    vec3 wi;
+    vec3 point_on_light;
+    vec3 LTE = lightSample_Direct_LTE(coordinate_system, scene_data, sampled_light_ID, R, wo, o, randomize_color, light_color, light_intensity, wi, point_on_light, rng_seed);
+
+    Intersection isect;
+    bool ray_hit_object = TraceRayDirect(scene_data, o, wi, isect);
+
+    if (ray_hit_object && isect.mesh_ID == scene_data.light_IDs.l[sampled_light_ID].mesh_ID && isect.tri_ID == scene_data.light_IDs.l[sampled_light_ID].tri_ID) {
+        return LTE;
+    }
+    else {
+        return vec3(0.0f);
+    }
+}
+
+void lightSample_RIS_Gen(in CoordinateSystem coordinate_system, in SceneBufferPointers scene_data, inout Reservoir reservoir, in vec3 R, in vec3 wo, in vec3 o, in int randomize_color, in vec3 light_color, in float light_intensity, inout uint rng_seed) {
+    for (int m = 0; m < M; ++m) {
+
+        // pick a light to sample with a uniform random variable
+        int mth_sampled_light_ID = uniformSample1DIndex(rng_seed, uni.num_lights);
+
+        vec3 wi;
+        vec3 point_on_light;
+        vec3 LTE = lightSample_Direct_LTE(coordinate_system, scene_data, mth_sampled_light_ID, R, vec3(0.0f), o, randomize_color, light_color, light_intensity, wi, point_on_light, rng_seed);
+        updateReservoir(reservoir, float(mth_sampled_light_ID), length(LTE), rnd(rng_seed), point_on_light);
+            
+    }
+}
+
+void main() {
+    ivec2 size = imageSize(inImage);
+
+    if (gl_GlobalInvocationID.x >= size.x || gl_GlobalInvocationID.y >= size.y) {
+        return;
+    }
+
+    
+
+    vec4 gBuffer = imageLoad(inImage, ivec2(gl_GlobalInvocationID.xy));
+    vec4 colorBuffer = imageLoad(colorImage, ivec2(gl_GlobalInvocationID.xy));
+
+    if (gBuffer == vec4(0)) {
+        imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), vec4(0,0,0, 1));
+        return;
+    }
+
+    else if (colorBuffer.w == 1.0f) {       
+        imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), vec4(0.25f * colorBuffer.xyz * light_intensity * vec3(light_color_X, light_color_Y, light_color_Z), 1));
+        return;
+    }
+
+    TemporalToSpatialReservoirs temporal_to_spatial_reservoirs = TemporalToSpatialReservoirs(restirDesc.temporalToSpatialReservoirAddress);
+    Reservoir temporal_to_spatial_reservoir;
+
+    Reservoir empty_reservoir = { 0, 0, 0, 0, vec3(0,0,0) };
+
+    temporal_to_spatial_reservoir = temporal_to_spatial_reservoirs.r_temp_to_spat[size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x];
+
+    uint seed = tea(size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x, (2 * frame_number) + 1);
+
+
+
+
+    vec3 first_bounce_position = gBuffer.xyz;
+    vec3 first_bounce_albedo = colorBuffer.xyz;
+    CoordinateSystem first_bounce_coord_sys = createCoordinateSystem(DecompressUnitVec(floatBitsToUint(gBuffer.w)));
+
+
+    SceneBufferPointers scene_data = {  Materials(sceneDesc.materialAddress),
+                                        Vertices(sceneDesc.vertexAddress),
+                                        Indices(sceneDesc.indexAddress),
+                                        Normals(sceneDesc.normalAddress),
+                                        TexCoords(sceneDesc.uvAddress),
+                                        LightIDs(sceneDesc.lightIDAddress)
+                                     };
+    
+
+    vec3 first_bounce_DI = vec3(0,0,0);
+
+    if (mode == RIS_LIGHT_SAMPLING) {
+        vec3 wi = normalize(temporal_to_spatial_reservoir.point_on_light - first_bounce_position);
+        int sampled_light_mesh_ID = scene_data.light_IDs.l[int(temporal_to_spatial_reservoir.sampled_light_ID)].mesh_ID;
+        int sampled_light_tri_ID = scene_data.light_IDs.l[int(temporal_to_spatial_reservoir.sampled_light_ID)].tri_ID;
+
+        Intersection isect;
+        bool ray_hit_object = TraceRayDirect(scene_data, first_bounce_position, wi, isect);
+
+        if (ray_hit_object && isect.mesh_ID == sampled_light_mesh_ID && isect.tri_ID == sampled_light_tri_ID) {
+            vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(temporal_to_spatial_reservoir.sampled_light_ID), first_bounce_albedo, vec3(0.0f), first_bounce_position, wi, temporal_to_spatial_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+            first_bounce_DI += LTE * temporal_to_spatial_reservoir.W;
+        }
+    }
+    else if (mode == RIS_TEMPORAL_LIGHT_SAMPLING) {
+        PreviousReservoirs previous_reservoirs = PreviousReservoirs(restirDesc.previousReservoirAddress);
+        Reservoir previous_reservoir;
+
+        vec3 wi = normalize(temporal_to_spatial_reservoir.point_on_light - first_bounce_position);
+        int sampled_light_mesh_ID = scene_data.light_IDs.l[int(temporal_to_spatial_reservoir.sampled_light_ID)].mesh_ID;
+        int sampled_light_tri_ID = scene_data.light_IDs.l[int(temporal_to_spatial_reservoir.sampled_light_ID)].tri_ID;
+
+        Intersection isect;
+        bool ray_hit_object = TraceRayDirect(scene_data, first_bounce_position, wi, isect);
+
+        if (ray_hit_object && isect.mesh_ID == sampled_light_mesh_ID && isect.tri_ID == sampled_light_tri_ID) {
+            vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(temporal_to_spatial_reservoir.sampled_light_ID), first_bounce_albedo, vec3(0.0f), first_bounce_position, wi, temporal_to_spatial_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+            first_bounce_DI += LTE * temporal_to_spatial_reservoir.W;
+        }
+        else {
+            temporal_to_spatial_reservoir.W = 0;
+        }
+
+        previous_reservoirs.r_prev[size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x] = temporal_to_spatial_reservoir;
+    }
+    else if (mode == RIS_TEMPORAL_SPATIAL_LIGHT_SAMPLING) {
+        PreviousReservoirs previous_reservoirs = PreviousReservoirs(restirDesc.previousReservoirAddress);
+        Reservoir previous_reservoir;
+
+        vec3 wi = normalize(temporal_to_spatial_reservoir.point_on_light - first_bounce_position);
+        vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(temporal_to_spatial_reservoir.sampled_light_ID), first_bounce_albedo, vec3(0.0f), first_bounce_position, wi, temporal_to_spatial_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+
+        float lightSamplesCount = temporal_to_spatial_reservoir.M;
+
+        Reservoir spatial_reuse_reservoir = { 0, 0, 0, 0, vec3(0,0,0) };
+
+        updateReservoir(spatial_reuse_reservoir, temporal_to_spatial_reservoir.sampled_light_ID, length(LTE) * temporal_to_spatial_reservoir.W * temporal_to_spatial_reservoir.M, rnd(seed), temporal_to_spatial_reservoir.point_on_light);
+
+        float cur_pixel_depth = length(first_bounce_position - uni.cam_world_pos.xyz);
+
+        int i = 0;
+        int num_tries = 0;
+        vec2 accepted_neighbors[5];
+        while (i < num_neighbors && num_tries < 20) {
+            num_tries++;
+            float radius = neighbor_radius * rnd(seed);
+            float angle = 2.0f * M_PI * rnd(seed);
+        
+            vec2 neighborIndex = gl_GlobalInvocationID.xy;
+        
+            neighborIndex.x += radius * cos(angle);
+            neighborIndex.y += radius * sin(angle);
+
+            vec2 u_neighbor = vec2(floor(neighborIndex));
+            if (u_neighbor.x < 0 || u_neighbor.x >= size.x || u_neighbor.y < 0 || u_neighbor.y >= size.y) {
+                continue;
+            }
+
+            if (i > 0) {
+                if (u_neighbor == accepted_neighbors[0]) {
+                    continue;
+                }
+            }
+            if (i > 1) {
+                if (u_neighbor == accepted_neighbors[1]) {
+                    continue;
+                }
+            }
+            if (i > 2) {
+                if (u_neighbor == accepted_neighbors[2]) {
+                    continue;
+                }
+            }
+            if (i > 3) {
+                if (u_neighbor == accepted_neighbors[3]) {
+                    continue;
+                }
+            }
+
+
+            vec4 gBuffer_neighbor = imageLoad(inImage, ivec2(u_neighbor));
+            vec4 colorBuffer_neighbor = imageLoad(colorImage, ivec2(u_neighbor));
+            vec3 neighbor_normal = DecompressUnitVec(floatBitsToUint(gBuffer_neighbor.w));
+
+            if (gBuffer_neighbor == vec4(0)) {
+                continue;
+            }
+
+            if (colorBuffer_neighbor.w == 1.0f) {
+                continue;
+            }
+
+
+            if (dot(first_bounce_coord_sys.normal, neighbor_normal) < 0.906f) {
+                continue;
+            }
+
+            float neighbor_pixel_depth = length(gBuffer_neighbor.xyz - uni.cam_world_pos.xyz);
+
+            if (neighbor_pixel_depth > 1.1f * cur_pixel_depth || neighbor_pixel_depth < 0.9f * cur_pixel_depth) {
+                continue;
+            }
+        
+            Reservoir neighbor_reservoir = temporal_to_spatial_reservoirs.r_temp_to_spat[size.x * int(u_neighbor.y) + int(u_neighbor.x)];
+
+            vec3 wi = normalize(neighbor_reservoir.point_on_light - first_bounce_position);
+            vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(neighbor_reservoir.sampled_light_ID), first_bounce_albedo, vec3(0.0f), first_bounce_position, wi, neighbor_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+
+
+            updateReservoir(spatial_reuse_reservoir, neighbor_reservoir.sampled_light_ID, length(LTE) * neighbor_reservoir.W * neighbor_reservoir.M, rnd(seed), neighbor_reservoir.point_on_light);
+                 
+            lightSamplesCount += neighbor_reservoir.M;
+
+            accepted_neighbors[i] = u_neighbor;
+            i++;
+            
+        }
+    
+        spatial_reuse_reservoir.M = lightSamplesCount;
+
+        wi = normalize(spatial_reuse_reservoir.point_on_light - first_bounce_position);
+        LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(spatial_reuse_reservoir.sampled_light_ID), first_bounce_albedo, vec3(0.0f), first_bounce_position, wi, spatial_reuse_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+
+        float p_hat = length(LTE);
+    
+        if (p_hat == 0.0f) {
+            spatial_reuse_reservoir.W = 0.0f;
+        }
+        else {
+            spatial_reuse_reservoir.W = (1.0f / max(p_hat, 0.00001f)) * (spatial_reuse_reservoir.wsum / max(spatial_reuse_reservoir.M, 0.0001));
+        }
+
+        wi = normalize(spatial_reuse_reservoir.point_on_light - first_bounce_position);
+        int sampled_light_mesh_ID = scene_data.light_IDs.l[int(spatial_reuse_reservoir.sampled_light_ID)].mesh_ID;
+        int sampled_light_tri_ID = scene_data.light_IDs.l[int(spatial_reuse_reservoir.sampled_light_ID)].tri_ID;
+
+        Intersection isect;
+        bool ray_hit_object = TraceRayDirect(scene_data, first_bounce_position, wi, isect);
+
+        if (ray_hit_object && isect.mesh_ID == sampled_light_mesh_ID && isect.tri_ID == sampled_light_tri_ID) {
+            first_bounce_DI += LTE * spatial_reuse_reservoir.W;
+            previous_reservoirs.r_prev[size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x] = spatial_reuse_reservoir;
+        }
+        else {
+            spatial_reuse_reservoir.W = 0;
+            previous_reservoirs.r_prev[size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x] = spatial_reuse_reservoir;
+        }
+    } 
+
+
+
+
+
+    vec3 diffuse_GI = vec3(0,0,0);
+    
+    vec3 ray_origin = first_bounce_position;
+    vec3 accumulated_light = vec3(0,0,0);
+    vec3 ray_throughput = vec3(1,1,1);
+
+    for (int i = 0; i < spp; ++i) {
+        accumulated_light = vec3(0,0,0);
+        ray_throughput = vec3(1,1,1);
+
+        ray_origin = first_bounce_position;
+
+        if (mode == BSDF_SAMPLING) {
+            accumulated_light += lightSample_BSDF(first_bounce_coord_sys, scene_data, first_bounce_albedo, vec3(0.0f), ray_origin, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+        }
+        else if (mode == DIRECT_LIGHT_SAMPLING) {
+            accumulated_light += lightSample_Direct(first_bounce_coord_sys, scene_data, first_bounce_albedo, vec3(0.0f), ray_origin, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+        }
+        else {
+            accumulated_light += first_bounce_DI;
+        }
+
+        if (ray_depth > 1) {
+            vec3 wi;
+            float pdf;
+            float cos_theta;
+            vec3 R = first_bounce_albedo;
+            vec3 f = sample_f_Diffuse_BRDF(first_bounce_coord_sys, R, vec3(0,0,0), wi, pdf, cos_theta, seed);
+
+            ray_throughput *= f * cos_theta / pdf;
+
+            Intersection isect;
+            bool ray_hit_object = TraceRayDirect(scene_data, ray_origin, wi, isect);
+
+            for (int depth = 1; depth < ray_depth; ++depth) {
+                if (ray_hit_object) {
+                    PrimMeshInfo pInfo = primInfo[isect.mesh_ID];
+                    if (length(scene_data.materials.m[max(0, pInfo.materialIndex)].emissiveFactor.xyz) > 0.01f) {
+                        break;
+                    }
+
+                    if (scene_data.materials.m[max(0, pInfo.materialIndex)].texture_IDs.x > -1.0f) {
+                      uint txtId = int(scene_data.materials.m[max(0, pInfo.materialIndex)].texture_IDs.x);
+                      CoordinateSystem NTB = createCoordinateSystem(isect.n);
+
+
+                      vec3 mappedNor = textureLod(texturesMap[nonuniformEXT(txtId)], isect.uv, 0).xyz;
+                      mappedNor = normalize((2.0f * mappedNor) - 1.0f);
+                      vec3 normalizedTan = normalize(NTB.tangent);
+                      vec3 normalizedBit = normalize(NTB.bitangent);
+                      mat3 surfaceToWorldN = mat3(normalizedTan, normalizedBit, isect.n);
+                      mappedNor = surfaceToWorldN * mappedNor;
+                      isect.n = normalize(mappedNor);
+
+                    }
+
+                    CoordinateSystem coordinate_system = createCoordinateSystem(isect.n);
+
+
+
+
+
+                    R = scene_data.materials.m[max(0, pInfo.materialIndex)].pbrBaseColor.xyz;
+                    if (int(scene_data.materials.m[max(0, pInfo.materialIndex)].pbrBaseColor.w) > -1) {
+                        uint txtId = int(scene_data.materials.m[max(0, pInfo.materialIndex)].pbrBaseColor.w);
+                        if (txtId < uni.num_textures) {
+                            R *= textureLod(texturesMap[nonuniformEXT(txtId)], isect.uv, 0).xyz;
+                        }
+                    }
+
+                    if (GI_mode == 1) {
+                        accumulated_light += ray_throughput * lightSample_BSDF(coordinate_system, scene_data, R, wi, isect.p, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+                    }
+                    else if (GI_mode == 2) {
+                        accumulated_light += ray_throughput * lightSample_Direct(coordinate_system, scene_data, R, wi, isect.p, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+                    }
+                    else if (GI_mode == 3) {
+                        Reservoir direct_reservoir = { 0, 0, 0, 0, vec3(0,0,0) };
+                        lightSample_RIS_Gen(coordinate_system, scene_data, direct_reservoir, R, vec3(0.0f), isect.p, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+
+
+                        vec3 wi_L = normalize(direct_reservoir.point_on_light - isect.p);
+                        vec3 LTE_L = lightSample_Direct_LTE_Calc(coordinate_system, scene_data, int(direct_reservoir.sampled_light_ID), R, vec3(0.0f), isect.p, wi_L, direct_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+
+                        float p_hat = length(LTE_L);
+        
+                        if (p_hat == 0.0f) {
+                            direct_reservoir.W = 0;
+                        }
+                        else {
+                            direct_reservoir.W = (1.0 / max(p_hat, 0.00001)) * (direct_reservoir.wsum / max(direct_reservoir.M, 0.000001));
+                        }
+
+                        wi_L = normalize(direct_reservoir.point_on_light - isect.p);
+                        int sampled_light_mesh_ID = scene_data.light_IDs.l[int(direct_reservoir.sampled_light_ID)].mesh_ID;
+                        int sampled_light_tri_ID = scene_data.light_IDs.l[int(direct_reservoir.sampled_light_ID)].tri_ID;
+
+                        Intersection isect_L;
+                        bool ray_hit_object_L = TraceRayDirect(scene_data, isect.p, wi_L, isect_L);
+
+                        if (ray_hit_object_L && isect_L.mesh_ID == sampled_light_mesh_ID && isect_L.tri_ID == sampled_light_tri_ID) {
+                            accumulated_light += ray_throughput * LTE_L * direct_reservoir.W;
+                        }
+                    }
+
+
+                    vec3 f = sample_f_Diffuse_BRDF(coordinate_system, R, vec3(0,0,0), wi, pdf, cos_theta, seed);
+
+                    ray_throughput *= f * cos_theta / pdf;
+                    ray_hit_object = TraceRayDirect(scene_data, isect.p, wi, isect);
+                }
+                else {
+                    break;
+                }
+            }
+        }
+
+        diffuse_GI += accumulated_light;
+    }
+
+    diffuse_GI /= float(spp);
+
+	imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), vec4( diffuse_GI, 1));
+}
