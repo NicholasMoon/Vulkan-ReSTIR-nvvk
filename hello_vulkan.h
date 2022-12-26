@@ -39,15 +39,10 @@ struct ReSTIRControl
   float light_color_X{1.0f};
   float light_color_Y{1.0f};
   float light_color_Z{1.0f};
-  int   randomize_color{0};
-  int   light_type{2};  // 0 is area, 1 is point light, 2 is mesh light
   int   two_sided_lights{0};   // 0 is single-sided, 1 is double_sided
   int   frame{0};                // Current frame
   int   mode{5};    // Direct Lighting Mode
   int   GI_mode{3};  // Direct Lighting Mode
-  int   M{16};
-  int   num_neighbors{5};
-  int   neighbor_radius{30};
 };
 
 

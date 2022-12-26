@@ -684,7 +684,7 @@ void HelloVulkan::rasterize(const VkCommandBuffer& cmdBuf)
 
   m_debug.beginLabel(cmdBuf, "Rasterize");
 
-  animateLights();
+  //animateLights();
 
   // Dynamic Viewport
   setViewport(cmdBuf);

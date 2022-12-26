@@ -55,15 +55,10 @@ layout(push_constant) uniform params_
   float light_color_X;
   float light_color_Y;
   float light_color_Z;
-  int   randomize_color;
-  int   light_type;
   int   two_sided_lights;
   int   frame_number;
   int   mode;
   int   GI_mode;
-  int   M;
-  int   num_neighbors;
-  int   neighbor_radius;
 };
 
 #define BSDF_SAMPLING 1
@@ -127,16 +122,7 @@ vec3 lightSample_BSDF(CoordinateSystem coordinate_system, SceneBufferPointers sc
     if (ray_hit_object) {
         PrimMeshInfo pInfo = primInfo[isect.mesh_ID];
 
-        vec3 Le;
-        if (light_type == AREA_LIGHT) {
-            Le = Le_SquarePlaneDiffuseAreaLight(pInfo, scene_data, wi, two_sided_lights, randomize_color, light_color, light_intensity);
-        }
-        else if (light_type == MESH_LIGHT) {
-            Le = Le_TriDiffuseAreaLight(pInfo, isect.tri_ID, scene_data, isect.p, wi, two_sided_lights, randomize_color, light_color, light_intensity);
-        }
-        else {
-            Le = Le_PointLight(pInfo, scene_data, wi, o, isect.t, light_color, light_intensity);
-        }
+        vec3 Le = Le_TriDiffuseAreaLight(pInfo, isect.tri_ID, scene_data, isect.p, wi, two_sided_lights, 0, light_color, light_intensity);
 
         if (length(Le) > 0.01f) {
             return Le * f * cos_theta / pdf;
@@ -159,17 +145,7 @@ vec3 lightSample_Direct_LTE(in CoordinateSystem coordinate_system, in SceneBuffe
     PrimMeshInfo pInfo = primInfo[sampled_light_mesh_ID];
 
     float pdf_L;
-    vec3 Le;
-    if (light_type == AREA_LIGHT) {
-        Le = sample_Le_SquarePlaneDiffuseAreaLight(pInfo, scene_data, two_sided_lights, randomize_color, light_color, light_intensity, o, wi, pdf_L, point_on_light, rng_seed);
-    }
-    else if (light_type == MESH_LIGHT) {
-        //int sampled_light_tri_ID = uniformSample1DIndex(rng_seed, pInfo.triCount);
-        Le = sample_Le_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, two_sided_lights, randomize_color, light_color, light_intensity, o, wi, pdf_L, point_on_light, rng_seed);
-    }
-    else {
-        Le = sample_Le_PointLight(pInfo, scene_data, o, wi, pdf_L, point_on_light, light_color, light_intensity);
-    }
+    vec3 Le = sample_Le_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, two_sided_lights, randomize_color, light_color, light_intensity, o, wi, pdf_L, point_on_light, rng_seed);
     
 
     float cos_theta = abs(dot(wi, coordinate_system.normal));
@@ -188,19 +164,8 @@ vec3 lightSample_Direct_LTE_Calc(in CoordinateSystem coordinate_system, in Scene
     PrimMeshInfo pInfo = primInfo[sampled_light_mesh_ID];
 
     float pdf_L;
-    vec3 Le;
-    if (light_type == AREA_LIGHT) {
-        Le = Le_SquarePlaneDiffuseAreaLight(pInfo, scene_data, wi, two_sided_lights, randomize_color, light_color, light_intensity);
-        pdf_L = pdf_SquarePlaneDiffuseAreaLight(pInfo, scene_data, o, point_on_light);
-    }
-    else if (light_type == MESH_LIGHT) {
-        Le = Le_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, point_on_light, wi, two_sided_lights, randomize_color, light_color, light_intensity);
-        pdf_L = pdf_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, o, point_on_light);
-    }
-    else {
-        Le = Le_PointLight(pInfo, scene_data, wi, o, length(point_on_light - o), light_color, light_intensity);
-        pdf_L = 1.0f;
-    }
+    vec3 Le = Le_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, point_on_light, wi, two_sided_lights, randomize_color, light_color, light_intensity);
+    pdf_L = pdf_TriDiffuseAreaLight(pInfo, sampled_light_tri_ID, scene_data, o, point_on_light);
     
 
     float cos_theta = abs(dot(wi, coordinate_system.normal));
@@ -230,7 +195,7 @@ vec3 lightSample_Direct(CoordinateSystem coordinate_system, SceneBufferPointers 
 }
 
 void lightSample_RIS_Gen(in CoordinateSystem coordinate_system, in SceneBufferPointers scene_data, inout Reservoir reservoir, in vec3 R, in vec3 wo, in vec3 o, in int randomize_color, in vec3 light_color, in float light_intensity, inout uint rng_seed) {
-    for (int m = 0; m < M; ++m) {
+    for (int m = 0; m < 16; ++m) {
 
         // pick a light to sample with a uniform random variable
         int mth_sampled_light_ID = uniformSample1DIndex(rng_seed, uni.num_lights);
@@ -288,10 +253,10 @@ void main() {
 
     if (mode == RIS_LIGHT_SAMPLING) {
         Reservoir reservoir = { 0, 0, 0, 0, vec3(0,0,0) };
-        lightSample_RIS_Gen(first_bounce_coord_sys, scene_data, reservoir, colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+        lightSample_RIS_Gen(first_bounce_coord_sys, scene_data, reservoir, colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, 0, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
 
         vec3 wi = normalize(reservoir.point_on_light - gBuffer.xyz);
-        vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+        vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, reservoir.point_on_light, 0, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
 
 
         float p_hat = length(LTE);
@@ -336,10 +301,10 @@ void main() {
             
 
         Reservoir reservoir = { 0, 0, 0, 0, vec3(0,0,0) };
-        lightSample_RIS_Gen(first_bounce_coord_sys, scene_data, reservoir, colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+        lightSample_RIS_Gen(first_bounce_coord_sys, scene_data, reservoir, colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, 0, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
 
         vec3 wi = normalize(reservoir.point_on_light - gBuffer.xyz);
-        vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+        vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, reservoir.point_on_light, 0, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
 
 
         float p_hat = length(LTE);
@@ -373,10 +338,8 @@ void main() {
         if (isect.tri_ID != sampled_light_tri_ID) {
             reservoir.W = 0;
         }
-        if (light_type == AREA_LIGHT || light_type == MESH_LIGHT) {
-            if (two_sided_lights == 0 && dot(wi, world_space_normal) > 0.0f) {
-                reservoir.W = 0;
-            }
+        if (two_sided_lights == 0 && dot(wi, world_space_normal) > 0.0f) {
+            reservoir.W = 0;
         }
 
         Reservoir temporal_reservoir = { 0, 0, 0, 0, vec3(0,0,0) };
@@ -393,14 +356,14 @@ void main() {
 
 
             vec3 wi = normalize(previous_reservoir.point_on_light - gBuffer.xyz);
-            vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(previous_reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, previous_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+            vec3 LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(previous_reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, previous_reservoir.point_on_light, 0, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
 
             p_hat = length(LTE);
 
             updateReservoir(temporal_reservoir, previous_reservoir.sampled_light_ID, p_hat * previous_reservoir.W * previous_reservoir.M, rnd(seed), previous_reservoir.point_on_light);
             
             wi = normalize(temporal_reservoir.point_on_light - gBuffer.xyz);
-            LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(temporal_reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, temporal_reservoir.point_on_light, randomize_color, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
+            LTE = lightSample_Direct_LTE_Calc(first_bounce_coord_sys, scene_data, int(temporal_reservoir.sampled_light_ID), colorBuffer.xyz, vec3(0.0f), gBuffer.xyz, wi, temporal_reservoir.point_on_light, 0, vec3(light_color_X, light_color_Y, light_color_Z), light_intensity, seed);
 
 
             temporal_reservoir.M = reservoir.M + previous_reservoir.M;

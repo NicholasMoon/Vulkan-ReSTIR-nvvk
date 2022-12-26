@@ -169,7 +169,7 @@ int main(int argc, char** argv)
   helloVk.loadSceneGLTF(nvh::findFile("media/scenes/cornell_box_many_lights.gltf", defaultSearchPaths, true));
 #endif
 #ifdef SPONZA
-  helloVk.loadSceneGLTF(nvh::findFile("media/scenes/emission/sponz.gltf", defaultSearchPaths, true));
+  helloVk.loadSceneGLTF(nvh::findFile("media/scenes/emission2/sponz.gltf", defaultSearchPaths, true));
 #endif
   
 
@@ -243,14 +243,9 @@ int main(int argc, char** argv)
           changed |= ImGui::SliderFloat("Light Color R", &restirControl.light_color_X, 0.01f, 1.0f);
           changed |= ImGui::SliderFloat("Light Color G", &restirControl.light_color_Y, 0.01f, 1.0f);
           changed |= ImGui::SliderFloat("Light Color B", &restirControl.light_color_Z, 0.01f, 1.0f);
-          changed |= ImGui::InputInt("Randomize Color", &restirControl.randomize_color);
           changed |= ImGui::InputInt("Two-Sided Lights", &restirControl.two_sided_lights);
-          changed |= ImGui::InputInt("Light Type", &restirControl.light_type);
           changed |= ImGui::InputInt("DI", &restirControl.mode);
           changed |= ImGui::InputInt("GI DI", &restirControl.GI_mode);
-          changed |= ImGui::InputInt("# RIS Samples", &restirControl.M);
-          changed |= ImGui::InputInt("# Neighbor Samples", &restirControl.num_neighbors);
-          changed |= ImGui::InputInt("Neighbor Radius", &restirControl.neighbor_radius);
           if(changed)
             helloVk.resetFrame();
         }

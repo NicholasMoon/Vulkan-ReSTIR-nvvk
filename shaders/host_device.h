@@ -78,7 +78,7 @@ struct PrimMeshInfo
   uint triCount;
   int  materialIndex;
 
-  vec4 dummy_data_0;
+  vec4 dummy_data_0; // need dummy data to pad out struct
 
   vec4 dummy_data_1;
 
@@ -89,8 +89,8 @@ struct PrimMeshInfo
 
 struct LightPointer
 {
-  int mesh_ID;
-  int tri_ID;
+  int mesh_ID;	// pointer to primitive
+  int tri_ID;	// pointer to tri in primitive (only support tri area lights)
 };
 
 
@@ -102,14 +102,12 @@ mat4 viewProj;  // Camera view * projection
 mat4 viewInverse;  // Camera inverse view matrix
 mat4 projInverse;  // Camera inverse projection matrix
 
-int num_meshes;
-int num_lights;
-int num_textures;
-int wre;
+int num_meshes; // num meshes in the scene
+int num_lights;	// num lights in the scene
+int num_textures; // num textures in the scenne
+int wre; // dummy data
 
 vec4 cam_world_pos;
-
-
 
 };
 
@@ -156,11 +154,11 @@ struct ReSTIRUniforms
 
 struct Reservoir
 {
-  float sampled_light_ID;  // The output sample
-  float wsum;              // the sum of weights
-  float M;                 // the number of samples seen so far
-  float W;                 // Probablistic weight
-  vec3  point_on_light;
+  float sampled_light_ID;  // light ID to sample
+  float wsum;              // sum of weights
+  float M;                 // number of light samples accounted for in this reservoir
+  float W;                 // weight for the current sample
+  vec3  point_on_light;	   // object space point on the light source
 };
 
 #endif
